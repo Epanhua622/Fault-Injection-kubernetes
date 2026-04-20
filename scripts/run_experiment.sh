@@ -6,5 +6,5 @@ kubectl apply -f k8s/recommender-hpa.yaml
 echo "Waiting for pods..."
 sleep 20
 
-kubectl get pods
-kubectl get hpa
+kubectl get pods -n teastore
+kubectl get hpa -n teastore

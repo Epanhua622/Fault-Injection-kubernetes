@@ -30,3 +30,16 @@ spec:
           limits:
             cpu: "500m"
             memory: "512Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: teastore-recommender
+  namespace: teastore
+spec:
+  selector:
+    app: teastore-recommender
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080

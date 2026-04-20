@@ -1,46 +1,305 @@
+import argparse
+import csv
+import math
 import random
 import subprocess
-from flask import Flask, jsonify
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+from flask import Flask, jsonify, request
+
 
 app = Flask(__name__)
 
+NAMESPACE = "teastore"
+DEPLOYMENT = "teastore-recommender"
+LABEL_SELECTOR = "app=teastore-recommender"
 
-def inject_fault(metric):
+DEFAULT_MIN_REPLICAS = 1
+DEFAULT_MAX_REPLICAS = 10
+DEFAULT_TARGET_CPU_MILLICORES = 120.0
+DEFAULT_TARGET_MEMORY_MI = 256.0
 
-    if random.random() < 0.2:   # 20% fault rate
-        mode = random.choice(["spike", "drop"])
+CSV_FIELDS = [
+    "timestamp",
+    "scenario",
+    "fault_type",
+    "pod_count",
+    "current_replicas",
+    "real_cpu_m",
+    "faulty_cpu_m",
+    "real_memory_mi",
+    "faulty_memory_mi",
+    "desired_replicas_cpu_clean",
+    "desired_replicas_cpu_faulty",
+    "desired_replicas_memory_clean",
+    "desired_replicas_memory_faulty",
+]
 
-        if mode == "spike":
-            return metric * 3
 
-        if mode == "drop":
-            return metric * 0.3
-
-    return metric
+def run_kubectl(args):
+    cmd = ["kubectl", *args]
+    return subprocess.check_output(cmd, text=True).strip()
 
 
-def get_cpu_usage():
+def parse_cpu_millicores(value):
+    if value.endswith("n"):
+        return float(value[:-1]) / 1_000_000.0
+    if value.endswith("u"):
+        return float(value[:-1]) / 1_000.0
+    if value.endswith("m"):
+        return float(value[:-1])
+    return float(value) * 1000.0
 
-    cmd = ["kubectl", "top", "pods", "-n", "teastore", "--no-headers"]
-    output = subprocess.check_output(cmd).decode()
 
-    cpu_str = output.split()[1]  # example: 120m
-    cpu = float(cpu_str.replace("m", ""))
+def parse_memory_mi(value):
+    units = {
+        "Ki": 1 / 1024,
+        "Mi": 1,
+        "Gi": 1024,
+        "Ti": 1024 * 1024,
+        "K": 1 / 1000,
+        "M": 1,
+        "G": 1000,
+        "T": 1000 * 1000,
+    }
 
-    return cpu
+    for suffix, multiplier in units.items():
+        if value.endswith(suffix):
+            return float(value[: -len(suffix)]) * multiplier
+
+    return float(value) / (1024 * 1024)
+
+
+def get_current_replicas():
+    output = run_kubectl([
+        "get",
+        "deployment",
+        DEPLOYMENT,
+        "-n",
+        NAMESPACE,
+        "-o",
+        "jsonpath={.status.replicas}",
+    ])
+    return int(output or "0")
+
+
+def get_pod_metrics():
+    output = run_kubectl([
+        "top",
+        "pods",
+        "-n",
+        NAMESPACE,
+        "-l",
+        LABEL_SELECTOR,
+        "--no-headers",
+    ])
+
+    rows = []
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+
+        rows.append({
+            "pod": parts[0],
+            "cpu_m": parse_cpu_millicores(parts[1]),
+            "memory_mi": parse_memory_mi(parts[2]),
+        })
+
+    if not rows:
+        raise RuntimeError("No pod metrics found for teastore-recommender.")
+
+    pod_count = len(rows)
+    total_cpu_m = sum(row["cpu_m"] for row in rows)
+    total_memory_mi = sum(row["memory_mi"] for row in rows)
+
+    return {
+        "pod_count": pod_count,
+        "avg_cpu_m": total_cpu_m / pod_count,
+        "avg_memory_mi": total_memory_mi / pod_count,
+        "total_cpu_m": total_cpu_m,
+        "total_memory_mi": total_memory_mi,
+        "pods": rows,
+    }
+
+
+def apply_fault(cpu_m, memory_mi, scenario, fault_rate):
+    if scenario == "baseline":
+        return cpu_m, memory_mi, "none"
+
+    if scenario == "random" and random.random() >= fault_rate:
+        return cpu_m, memory_mi, "none"
+
+    if scenario == "random":
+        scenario = random.choice([
+            "cpu-spike",
+            "cpu-drop",
+            "memory-spike",
+            "memory-drop",
+        ])
+
+    if scenario == "cpu-spike":
+        return cpu_m * 3.0, memory_mi, "cpu_spike"
+    if scenario == "cpu-drop":
+        return cpu_m * 0.3, memory_mi, "cpu_drop"
+    if scenario == "memory-spike":
+        return cpu_m, memory_mi * 2.0, "memory_spike"
+    if scenario == "memory-drop":
+        return cpu_m, memory_mi * 0.5, "memory_drop"
+
+    raise ValueError(f"Unknown scenario: {scenario}")
+
+
+def estimate_desired_replicas(current_replicas, observed_value, target_value, min_replicas, max_replicas):
+    if current_replicas <= 0 or target_value <= 0:
+        return min_replicas
+
+    desired = math.ceil(current_replicas * observed_value / target_value)
+    return max(min_replicas, min(max_replicas, desired))
+
+
+def collect_sample(args):
+    metrics = get_pod_metrics()
+    current_replicas = get_current_replicas()
+    real_cpu_m = metrics["avg_cpu_m"]
+    real_memory_mi = metrics["avg_memory_mi"]
+    faulty_cpu_m, faulty_memory_mi, fault_type = apply_fault(
+        real_cpu_m,
+        real_memory_mi,
+        args.scenario,
+        args.fault_rate,
+    )
+
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "scenario": args.scenario,
+        "fault_type": fault_type,
+        "pod_count": metrics["pod_count"],
+        "current_replicas": current_replicas,
+        "real_cpu_m": round(real_cpu_m, 3),
+        "faulty_cpu_m": round(faulty_cpu_m, 3),
+        "real_memory_mi": round(real_memory_mi, 3),
+        "faulty_memory_mi": round(faulty_memory_mi, 3),
+        "desired_replicas_cpu_clean": estimate_desired_replicas(
+            current_replicas,
+            real_cpu_m,
+            args.target_cpu_m,
+            args.min_replicas,
+            args.max_replicas,
+        ),
+        "desired_replicas_cpu_faulty": estimate_desired_replicas(
+            current_replicas,
+            faulty_cpu_m,
+            args.target_cpu_m,
+            args.min_replicas,
+            args.max_replicas,
+        ),
+        "desired_replicas_memory_clean": estimate_desired_replicas(
+            current_replicas,
+            real_memory_mi,
+            args.target_memory_mi,
+            args.min_replicas,
+            args.max_replicas,
+        ),
+        "desired_replicas_memory_faulty": estimate_desired_replicas(
+            current_replicas,
+            faulty_memory_mi,
+            args.target_memory_mi,
+            args.min_replicas,
+            args.max_replicas,
+        ),
+    }
+
+
+def append_csv(path, row):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    should_write_header = not path.exists()
+
+    with path.open("a", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=CSV_FIELDS)
+        if should_write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def collect_loop(args):
+    deadline = None
+    if args.duration > 0:
+        deadline = time.monotonic() + args.duration
+
+    while deadline is None or time.monotonic() < deadline:
+        row = collect_sample(args)
+        append_csv(args.output, row)
+        print(row, flush=True)
+        time.sleep(args.interval)
 
 
 @app.route("/metric")
 def metric():
+    args = build_args([
+        "serve",
+        "--scenario",
+        request.args.get("scenario", "random"),
+        "--fault-rate",
+        request.args.get("fault_rate", "0.2"),
+    ])
+    row = collect_sample(args)
 
-    real_cpu = get_cpu_usage()
-    faulty_cpu = inject_fault(real_cpu)
+    return jsonify(row)
 
-    return jsonify({
-        "real_cpu": real_cpu,
-        "faulty_cpu": faulty_cpu
-    })
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description="Collect Kubernetes pod metrics and simulate autoscaling faults.",
+    )
+    subparsers = parser.add_subparsers(dest="command")
+
+    for command in ("serve", "collect"):
+        subparser = subparsers.add_parser(command)
+        subparser.add_argument(
+            "--scenario",
+            choices=[
+                "baseline",
+                "cpu-spike",
+                "cpu-drop",
+                "memory-spike",
+                "memory-drop",
+                "random",
+            ],
+            default="random",
+        )
+        subparser.add_argument("--fault-rate", type=float, default=0.2)
+        subparser.add_argument("--target-cpu-m", type=float, default=DEFAULT_TARGET_CPU_MILLICORES)
+        subparser.add_argument("--target-memory-mi", type=float, default=DEFAULT_TARGET_MEMORY_MI)
+        subparser.add_argument("--min-replicas", type=int, default=DEFAULT_MIN_REPLICAS)
+        subparser.add_argument("--max-replicas", type=int, default=DEFAULT_MAX_REPLICAS)
+
+    collect_parser = subparsers.choices["collect"]
+    collect_parser.add_argument("--interval", type=float, default=15.0)
+    collect_parser.add_argument("--duration", type=float, default=300.0)
+    collect_parser.add_argument("--output", default="results/fault-injection.csv")
+
+    serve_parser = subparsers.choices["serve"]
+    serve_parser.add_argument("--host", default="0.0.0.0")
+    serve_parser.add_argument("--port", type=int, default=5001)
+
+    return parser
+
+
+def build_args(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.command is None:
+        args = parser.parse_args(["serve"])
+    return args
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5001)
+    cli_args = build_args()
+    if cli_args.command == "collect":
+        collect_loop(cli_args)
+    else:
+        app.run(host=cli_args.host, port=cli_args.port)
