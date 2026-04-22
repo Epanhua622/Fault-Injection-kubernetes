@@ -2,3 +2,4 @@ locust
 flask
 kubernetes
 scikit-learn
+matplotlib
