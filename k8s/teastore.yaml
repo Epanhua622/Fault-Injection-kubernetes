@@ -140,11 +140,11 @@ spec:
           periodSeconds: 5
         resources:
           requests:
-            cpu: "350m"
-            memory: "384Mi"
+            cpu: "250m"
+            memory: "256Mi"
           limits:
-            cpu: "800m"
-            memory: "1536Mi"
+            cpu: "600m"
+            memory: "1024Mi"
 ---
 apiVersion: v1
 kind: Service
@@ -195,11 +195,11 @@ spec:
           periodSeconds: 5
         resources:
           requests:
-            cpu: "300m"
-            memory: "384Mi"
+            cpu: "200m"
+            memory: "256Mi"
           limits:
-            cpu: "800m"
-            memory: "1280Mi"
+            cpu: "600m"
+            memory: "768Mi"
 ---
 apiVersion: v1
 kind: Service
@@ -250,11 +250,11 @@ spec:
           periodSeconds: 5
         resources:
           requests:
-            cpu: "300m"
-            memory: "384Mi"
+            cpu: "200m"
+            memory: "256Mi"
           limits:
-            cpu: "800m"
-            memory: "1024Mi"
+            cpu: "600m"
+            memory: "768Mi"
 ---
 apiVersion: v1
 kind: Service
@@ -305,11 +305,11 @@ spec:
           periodSeconds: 5
         resources:
           requests:
-            cpu: "400m"
-            memory: "384Mi"
+            cpu: "300m"
+            memory: "256Mi"
           limits:
-            cpu: "1000m"
-            memory: "1024Mi"
+            cpu: "800m"
+            memory: "768Mi"
 ---
 apiVersion: v1
 kind: Service
@@ -369,11 +369,11 @@ spec:
           failureThreshold: 6
         resources:
           requests:
-            cpu: "500m"
-            memory: "512Mi"
+            cpu: "300m"
+            memory: "384Mi"
           limits:
-            cpu: "1000m"
-            memory: "1536Mi"
+            cpu: "800m"
+            memory: "1024Mi"
 ---
 apiVersion: v1
 kind: Service

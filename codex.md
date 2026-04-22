@@ -152,22 +152,19 @@ Install Python dependencies:
 pip install -r requirements.txt
 ```
 
-Install metrics-server if it is not already installed:
+For a fresh Kubernetes cluster, install metrics-server from the upstream manifest first:
 
 ```sh
 kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
 ```
 
-Patch metrics-server for Docker Desktop:
+Do not run `kubectl apply -f k8s/metrics-server.yaml`. That file in this repo is only a partial deployment fragment and will fail if applied by itself.
+
+Patch metrics-server for Docker Desktop using the repo patch file:
 
 ```sh
-kubectl patch deployment metrics-server \
-  -n kube-system \
-  --type='json' \
-  -p='[
-  {"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"},
-  {"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-preferred-address-types=InternalIP"}
-  ]'
+kubectl patch deployment metrics-server -n kube-system \
+  --patch-file k8s/metrics-server-patch.yaml
 ```
 
 Restart metrics-server:
@@ -184,6 +181,32 @@ kubectl top pods -n kube-system
 ```
 
 If `kubectl top` fails, do not continue with HPA experiments until metrics-server is healthy.
+
+The shortest correct fresh-cluster setup is:
+
+```sh
+pip install -r requirements.txt
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+kubectl patch deployment metrics-server -n kube-system --patch-file k8s/metrics-server-patch.yaml
+kubectl rollout restart deployment metrics-server -n kube-system
+kubectl top nodes
+kubectl apply -f k8s/teastore.yaml
+kubectl apply -f k8s/webui-hpa.yaml
+```
+
+Or use the bootstrap script that runs the full sequence and waits for readiness:
+
+```sh
+./scripts/bootstrap_fresh_k8s.sh
+```
+
+Optional HPA mode:
+
+```sh
+./scripts/bootstrap_fresh_k8s.sh webui
+./scripts/bootstrap_fresh_k8s.sh recommender
+./scripts/bootstrap_fresh_k8s.sh none
+```
 
 ## Deploy The Workload
 

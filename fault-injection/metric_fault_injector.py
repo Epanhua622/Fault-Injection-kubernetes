@@ -21,6 +21,14 @@ DEFAULT_MAX_REPLICAS = 1000
 DEFAULT_TARGET_CPU_MILLICORES = 300.0
 DEFAULT_TARGET_MEMORY_MI = 512.0
 
+# VPA simulation defaults
+# Safety margin approximates VPA's 90th-percentile histogram target with headroom
+DEFAULT_VPA_SAFETY_MARGIN = 1.15
+DEFAULT_VPA_MIN_CPU_M = 100.0
+DEFAULT_VPA_MAX_CPU_M = 2000.0
+DEFAULT_VPA_MIN_MEMORY_MI = 128.0
+DEFAULT_VPA_MAX_MEMORY_MI = 1024.0
+
 CSV_FIELDS = [
     "timestamp",
     "scenario",
@@ -37,6 +45,13 @@ CSV_FIELDS = [
     "desired_replicas_cpu_faulty",
     "desired_replicas_memory_clean",
     "desired_replicas_memory_faulty",
+    # VPA simulation columns
+    "vpa_cpu_rec_clean_m",
+    "vpa_cpu_rec_faulty_m",
+    "vpa_memory_rec_clean_mi",
+    "vpa_memory_rec_faulty_mi",
+    "vpa_cpu_risk",
+    "vpa_memory_risk",
 ]
 
 
@@ -170,6 +185,28 @@ def estimate_desired_replicas(current_replicas, observed_value, target_value, mi
     return max(min_replicas, min(max_replicas, desired))
 
 
+def estimate_vpa_recommendation(observed_value, safety_margin, min_allowed, max_allowed):
+    """Simulate VPA Recommender: target = observed * safety_margin, clamped to policy bounds."""
+    recommended = observed_value * safety_margin
+    return round(max(min_allowed, min(max_allowed, recommended)), 3)
+
+
+def vpa_risk(real_value, faulty_recommendation):
+    """
+    Classify the reliability/availability risk introduced by a faulty VPA recommendation.
+
+    under_provisioned: faulty rec < real usage  → pod may be throttled or OOM-killed (reliability risk)
+    over_provisioned:  faulty rec > real usage * safety headroom → wastes node capacity,
+                       may prevent scheduling if node lacks headroom (availability risk)
+    accurate:          faulty rec is within normal headroom of real usage
+    """
+    if faulty_recommendation < real_value:
+        return "under_provisioned"
+    if faulty_recommendation > real_value * 1.5:
+        return "over_provisioned"
+    return "accurate"
+
+
 def collect_sample(args):
     metrics = get_pod_metrics(args)
     current_replicas = get_current_replicas(args)
@@ -222,6 +259,25 @@ def collect_sample(args):
             args.min_replicas,
             args.max_replicas,
         ),
+        # VPA simulation: what resource requests would VPA set under clean vs faulty metrics?
+        "vpa_cpu_rec_clean_m": estimate_vpa_recommendation(
+            real_cpu_m, args.vpa_safety_margin, args.vpa_min_cpu_m, args.vpa_max_cpu_m,
+        ),
+        "vpa_cpu_rec_faulty_m": estimate_vpa_recommendation(
+            faulty_cpu_m, args.vpa_safety_margin, args.vpa_min_cpu_m, args.vpa_max_cpu_m,
+        ),
+        "vpa_memory_rec_clean_mi": estimate_vpa_recommendation(
+            real_memory_mi, args.vpa_safety_margin, args.vpa_min_memory_mi, args.vpa_max_memory_mi,
+        ),
+        "vpa_memory_rec_faulty_mi": estimate_vpa_recommendation(
+            faulty_memory_mi, args.vpa_safety_margin, args.vpa_min_memory_mi, args.vpa_max_memory_mi,
+        ),
+        "vpa_cpu_risk": vpa_risk(real_cpu_m, estimate_vpa_recommendation(
+            faulty_cpu_m, args.vpa_safety_margin, args.vpa_min_cpu_m, args.vpa_max_cpu_m,
+        )),
+        "vpa_memory_risk": vpa_risk(real_memory_mi, estimate_vpa_recommendation(
+            faulty_memory_mi, args.vpa_safety_margin, args.vpa_min_memory_mi, args.vpa_max_memory_mi,
+        )),
     }
 
 
@@ -291,6 +347,11 @@ def build_parser():
         subparser.add_argument("--target-memory-mi", type=float, default=DEFAULT_TARGET_MEMORY_MI)
         subparser.add_argument("--min-replicas", type=int, default=DEFAULT_MIN_REPLICAS)
         subparser.add_argument("--max-replicas", type=int, default=DEFAULT_MAX_REPLICAS)
+        subparser.add_argument("--vpa-safety-margin", type=float, default=DEFAULT_VPA_SAFETY_MARGIN)
+        subparser.add_argument("--vpa-min-cpu-m", type=float, default=DEFAULT_VPA_MIN_CPU_M)
+        subparser.add_argument("--vpa-max-cpu-m", type=float, default=DEFAULT_VPA_MAX_CPU_M)
+        subparser.add_argument("--vpa-min-memory-mi", type=float, default=DEFAULT_VPA_MIN_MEMORY_MI)
+        subparser.add_argument("--vpa-max-memory-mi", type=float, default=DEFAULT_VPA_MAX_MEMORY_MI)
 
     collect_parser = subparsers.choices["collect"]
     collect_parser.add_argument("--interval", type=float, default=15.0)

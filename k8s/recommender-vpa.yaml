@@ -1,0 +1,22 @@
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: teastore-recommender-vpa
+  namespace: teastore
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: teastore-recommender
+  updatePolicy:
+    updateMode: "Off"   # recommends only — does not restart or mutate pods
+  resourcePolicy:
+    containerPolicies:
+    - containerName: teastore-recommender
+      minAllowed:
+        cpu: 100m
+        memory: 128Mi
+      maxAllowed:
+        cpu: 2000m
+        memory: 1Gi
+      controlledResources: ["cpu", "memory"]
