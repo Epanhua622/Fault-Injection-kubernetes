@@ -1,3 +1,4 @@
 locust
 flask
 kubernetes
+scikit-learn

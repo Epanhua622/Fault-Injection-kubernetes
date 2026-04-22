@@ -361,9 +361,13 @@ python fault-injection/metric_fault_injector.py collect \
 
 In `random-multiplier`, the collector samples a random floating-point value from `0` to `100` on each interval and multiplies both CPU and memory by that value.
 
-## Mitigation Filter
+## Mitigation Filters
 
-The collector includes a two-layer transient fault mitigation filter named `MetricFilter`.
+The collector currently runs two mitigation strategies on every faulty sample.
+
+### Mitigation 1: Z-score + Windowed Median
+
+The first mitigation path uses the `MetricFilter` rule-based filter.
 
 Layer 1: z-score outlier rejection
 
@@ -393,6 +397,60 @@ python fault-injection/metric_fault_injector.py collect \
   --interval 15 \
   --output results/webui-random-multiplier.csv
 ```
+
+### Mitigation 2: Isolation Forest + Windowed Median
+
+The second mitigation path uses an Isolation Forest model over the joint `(cpu, memory)` feature vector.
+
+Why this matters:
+
+- z-score works independently on CPU and memory
+- Isolation Forest looks at the joint pair, so it can flag contextually strange combinations such as a CPU spike with no corresponding memory increase
+
+Isolation Forest options:
+
+```text
+if-contamination = 0.1
+if-warmup = 20
+train-data = optional baseline CSV
+```
+
+Collector flags:
+
+```sh
+--if-contamination 0.1
+--if-warmup 20
+--train-data results/baseline.csv
+```
+
+Recommended train/test workflow:
+
+Step 1: collect a clean baseline
+
+```sh
+python fault-injection/metric_fault_injector.py collect \
+  --deployment teastore-webui \
+  --label-selector app=teastore-webui \
+  --scenario baseline \
+  --duration 300 \
+  --interval 15 \
+  --output results/baseline.csv
+```
+
+Step 2: run a fault scenario with the IF model pre-trained on that baseline
+
+```sh
+python fault-injection/metric_fault_injector.py collect \
+  --deployment teastore-webui \
+  --label-selector app=teastore-webui \
+  --scenario cpu-spike \
+  --train-data results/baseline.csv \
+  --duration 600 \
+  --interval 15 \
+  --output results/webui-cpu-spike.csv
+```
+
+If you do not pass `--train-data`, the IF model warms up online during the first `--if-warmup` samples.
 
 ## Switching The Collector Target
 
@@ -480,6 +538,15 @@ vpa_cpu_rec_mitigated_m
 vpa_memory_rec_mitigated_mi
 vpa_cpu_risk_mitigated
 vpa_memory_risk_mitigated
+if_sample_rejected
+effective_cpu_m_if
+effective_memory_mi_if
+desired_replicas_cpu_if
+desired_replicas_memory_if
+vpa_cpu_rec_if_m
+vpa_memory_rec_if_mi
+vpa_cpu_risk_if
+vpa_memory_risk_if
 ```
 
 The most important comparisons are:
@@ -493,6 +560,12 @@ vpa_cpu_rec_clean_m vs vpa_cpu_rec_faulty_m vs vpa_cpu_rec_mitigated_m
 vpa_memory_rec_clean_mi vs vpa_memory_rec_faulty_mi vs vpa_memory_rec_mitigated_mi
 vpa_cpu_risk vs vpa_cpu_risk_mitigated
 vpa_memory_risk vs vpa_memory_risk_mitigated
+desired_replicas_cpu_faulty vs desired_replicas_cpu_if
+desired_replicas_memory_faulty vs desired_replicas_memory_if
+vpa_cpu_rec_faulty_m vs vpa_cpu_rec_if_m
+vpa_memory_rec_faulty_mi vs vpa_memory_rec_if_mi
+vpa_cpu_risk vs vpa_cpu_risk_if
+vpa_memory_risk vs vpa_memory_risk_if
 ```
 
 If the faulty desired replica count is higher than the clean desired replica count, the fault would cause over-scaling.
@@ -500,6 +573,8 @@ If the faulty desired replica count is higher than the clean desired replica cou
 If the faulty desired replica count is lower than the clean desired replica count, the fault would cause under-scaling.
 
 If the mitigated result moves back toward the clean result, the mitigation filter improved the decision quality.
+
+If the IF result moves closer to the clean result than the faulty result did, the Isolation Forest path improved the decision quality.
 
 ## Suggested Experiment Matrix
 

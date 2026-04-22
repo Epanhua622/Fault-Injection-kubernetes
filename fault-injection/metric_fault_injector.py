@@ -27,6 +27,10 @@ DEFAULT_TARGET_MEMORY_MI = 512.0
 DEFAULT_WINDOW_SIZE = 5        # number of samples in the sliding window
 DEFAULT_ZSCORE_THRESHOLD = 2.0 # samples beyond this many std-devs are rejected
 
+# Isolation Forest detector defaults
+DEFAULT_IF_CONTAMINATION = 0.1  # expected fraction of anomalies in training data
+DEFAULT_IF_WARMUP = 20          # samples collected before fitting model (used when no --train-data)
+
 # VPA simulation defaults
 # Safety margin approximates VPA's 90th-percentile histogram target with headroom
 DEFAULT_VPA_SAFETY_MARGIN = 1.15
@@ -58,7 +62,7 @@ CSV_FIELDS = [
     "vpa_memory_rec_faulty_mi",
     "vpa_cpu_risk",
     "vpa_memory_risk",
-    # Mitigation columns — windowed median after z-score outlier rejection
+    # Z-score mitigation columns — windowed median after z-score outlier rejection
     "cpu_outlier_rejected",
     "memory_outlier_rejected",
     "effective_cpu_m",
@@ -69,6 +73,16 @@ CSV_FIELDS = [
     "vpa_memory_rec_mitigated_mi",
     "vpa_cpu_risk_mitigated",
     "vpa_memory_risk_mitigated",
+    # Isolation Forest mitigation columns — joint anomaly detection on (cpu, memory) vector
+    "if_sample_rejected",
+    "effective_cpu_m_if",
+    "effective_memory_mi_if",
+    "desired_replicas_cpu_if",
+    "desired_replicas_memory_if",
+    "vpa_cpu_rec_if_m",
+    "vpa_memory_rec_if_mi",
+    "vpa_cpu_risk_if",
+    "vpa_memory_risk_if",
 ]
 
 
@@ -273,18 +287,102 @@ class MetricFilter:
         return value, False
 
 
-# Module-level filter used by the Flask serve handler (one persistent window per process).
-_serve_filter: MetricFilter | None = None
+class IsolationForestFilter:
+    """
+    Anomaly detection using Isolation Forest on the joint (cpu, memory) feature vector.
+
+    Advantage over per-metric z-score: learns the *correlation* between CPU and memory.
+    A CPU spike with no matching memory increase is contextually anomalous even if the
+    CPU value alone isn't extreme — IF catches this, z-score does not.
+
+    Detection: sklearn IsolationForest scores the joint sample. Score -1 = anomaly.
+    Correction: same as MetricFilter — substitute rejected sample with rolling mean,
+                then report windowed median as the effective value.
+
+    Warm-up: the first `warmup_size` samples are passed through unfiltered while the
+             model is being fitted. Pass --train-data <baseline.csv> to skip warm-up
+             by fitting on pre-collected clean data before the experiment starts.
+    """
+
+    def __init__(self, window_size, contamination, warmup_size):
+        self._contamination = contamination
+        self._warmup_size = warmup_size
+        self._warmup_buf = []
+        self._model = None
+        self._cpu: deque = deque(maxlen=window_size)
+        self._memory: deque = deque(maxlen=window_size)
+
+    def fit_from_csv(self, csv_path):
+        """Fit the model on real_cpu_m / real_memory_mi from a pre-collected baseline CSV."""
+        import csv as _csv
+        samples = []
+        with open(csv_path, newline="") as f:
+            for row in _csv.DictReader(f):
+                try:
+                    samples.append([float(row["real_cpu_m"]), float(row["real_memory_mi"])])
+                except (KeyError, ValueError):
+                    continue
+        if len(samples) >= 10:
+            self._fit(samples)
+            print(f"[IsolationForest] fitted on {len(samples)} samples from {csv_path}", flush=True)
+        else:
+            print(f"[IsolationForest] not enough samples in {csv_path}, will warm up online", flush=True)
+
+    def _fit(self, samples):
+        try:
+            from sklearn.ensemble import IsolationForest
+        except ImportError:
+            raise RuntimeError("scikit-learn is required. Run: pip install scikit-learn")
+        self._model = IsolationForest(contamination=self._contamination, random_state=42)
+        self._model.fit(samples)
+
+    def update(self, faulty_cpu_m, faulty_memory_mi):
+        """
+        Feed one faulty sample into the filter.
+        Returns (effective_cpu_m, effective_memory_mi, sample_rejected).
+        sample_rejected is True when the joint (cpu, memory) vector is flagged anomalous.
+        """
+        if self._model is None:
+            self._warmup_buf.append([faulty_cpu_m, faulty_memory_mi])
+            if len(self._warmup_buf) >= self._warmup_size:
+                self._fit(self._warmup_buf)
+                print(f"[IsolationForest] fitted after {self._warmup_size}-sample warm-up", flush=True)
+            self._cpu.append(faulty_cpu_m)
+            self._memory.append(faulty_memory_mi)
+            return round(statistics.median(self._cpu), 3), round(statistics.median(self._memory), 3), False
+
+        prediction = self._model.predict([[faulty_cpu_m, faulty_memory_mi]])[0]
+        rejected = prediction == -1
+
+        if rejected and len(self._cpu) >= 1:
+            cpu_accepted = statistics.mean(self._cpu)
+            mem_accepted = statistics.mean(self._memory)
+        else:
+            cpu_accepted, mem_accepted = faulty_cpu_m, faulty_memory_mi
+
+        self._cpu.append(cpu_accepted)
+        self._memory.append(mem_accepted)
+
+        return round(statistics.median(self._cpu), 3), round(statistics.median(self._memory), 3), rejected
 
 
-def _get_serve_filter(args):
-    global _serve_filter
-    if _serve_filter is None:
-        _serve_filter = MetricFilter(args.window_size, args.zscore_threshold)
-    return _serve_filter
+# Module-level filters used by the Flask serve handler (one persistent window per process).
+_serve_zscore_filter: MetricFilter | None = None
+_serve_if_filter: IsolationForestFilter | None = None
 
 
-def collect_sample(args, metric_filter):
+def _get_serve_filters(args):
+    global _serve_zscore_filter, _serve_if_filter
+    if _serve_zscore_filter is None:
+        _serve_zscore_filter = MetricFilter(args.window_size, args.zscore_threshold)
+    if _serve_if_filter is None:
+        _serve_if_filter = IsolationForestFilter(args.window_size, args.if_contamination, args.if_warmup)
+        if args.train_data:
+            _serve_if_filter.fit_from_csv(args.train_data)
+    return _serve_zscore_filter, _serve_if_filter
+
+
+def collect_sample(args, zscore_filter, if_filter):
     metrics = get_pod_metrics(args)
     current_replicas = get_current_replicas(args)
     real_cpu_m = metrics["avg_cpu_m"]
@@ -296,7 +394,10 @@ def collect_sample(args, metric_filter):
         args.fault_rate,
     )
 
-    effective_cpu_m, effective_memory_mi, cpu_rejected, mem_rejected = metric_filter.update(
+    effective_cpu_m, effective_memory_mi, cpu_rejected, mem_rejected = zscore_filter.update(
+        faulty_cpu_m, faulty_memory_mi,
+    )
+    effective_cpu_m_if, effective_memory_mi_if, if_rejected = if_filter.update(
         faulty_cpu_m, faulty_memory_mi,
     )
 
@@ -390,6 +491,36 @@ def collect_sample(args, metric_filter):
         "vpa_memory_risk_mitigated": vpa_risk(real_memory_mi, estimate_vpa_recommendation(
             effective_memory_mi, args.vpa_safety_margin, args.vpa_min_memory_mi, args.vpa_max_memory_mi,
         )),
+        # Isolation Forest mitigation outcomes
+        "if_sample_rejected": if_rejected,
+        "effective_cpu_m_if": effective_cpu_m_if,
+        "effective_memory_mi_if": effective_memory_mi_if,
+        "desired_replicas_cpu_if": estimate_desired_replicas(
+            current_replicas,
+            effective_cpu_m_if,
+            args.target_cpu_m,
+            args.min_replicas,
+            args.max_replicas,
+        ),
+        "desired_replicas_memory_if": estimate_desired_replicas(
+            current_replicas,
+            effective_memory_mi_if,
+            args.target_memory_mi,
+            args.min_replicas,
+            args.max_replicas,
+        ),
+        "vpa_cpu_rec_if_m": estimate_vpa_recommendation(
+            effective_cpu_m_if, args.vpa_safety_margin, args.vpa_min_cpu_m, args.vpa_max_cpu_m,
+        ),
+        "vpa_memory_rec_if_mi": estimate_vpa_recommendation(
+            effective_memory_mi_if, args.vpa_safety_margin, args.vpa_min_memory_mi, args.vpa_max_memory_mi,
+        ),
+        "vpa_cpu_risk_if": vpa_risk(real_cpu_m, estimate_vpa_recommendation(
+            effective_cpu_m_if, args.vpa_safety_margin, args.vpa_min_cpu_m, args.vpa_max_cpu_m,
+        )),
+        "vpa_memory_risk_if": vpa_risk(real_memory_mi, estimate_vpa_recommendation(
+            effective_memory_mi_if, args.vpa_safety_margin, args.vpa_min_memory_mi, args.vpa_max_memory_mi,
+        )),
     }
 
 
@@ -406,13 +537,17 @@ def append_csv(path, row):
 
 
 def collect_loop(args):
-    metric_filter = MetricFilter(args.window_size, args.zscore_threshold)
+    zscore_filter = MetricFilter(args.window_size, args.zscore_threshold)
+    if_filter = IsolationForestFilter(args.window_size, args.if_contamination, args.if_warmup)
+    if args.train_data:
+        if_filter.fit_from_csv(args.train_data)
+
     deadline = None
     if args.duration > 0:
         deadline = time.monotonic() + args.duration
 
     while deadline is None or time.monotonic() < deadline:
-        row = collect_sample(args, metric_filter)
+        row = collect_sample(args, zscore_filter, if_filter)
         append_csv(args.output, row)
         print(row, flush=True)
         time.sleep(args.interval)
@@ -427,7 +562,8 @@ def metric():
         "--fault-rate",
         request.args.get("fault_rate", "0.2"),
     ])
-    row = collect_sample(args, _get_serve_filter(args))
+    zscore_filter, if_filter = _get_serve_filters(args)
+    row = collect_sample(args, zscore_filter, if_filter)
     return jsonify(row)
 
 
@@ -466,6 +602,10 @@ def build_parser():
         subparser.add_argument("--vpa-max-memory-mi", type=float, default=DEFAULT_VPA_MAX_MEMORY_MI)
         subparser.add_argument("--window-size", type=int, default=DEFAULT_WINDOW_SIZE)
         subparser.add_argument("--zscore-threshold", type=float, default=DEFAULT_ZSCORE_THRESHOLD)
+        subparser.add_argument("--if-contamination", type=float, default=DEFAULT_IF_CONTAMINATION)
+        subparser.add_argument("--if-warmup", type=int, default=DEFAULT_IF_WARMUP)
+        subparser.add_argument("--train-data", default=None,
+                               help="Path to a baseline CSV to train the Isolation Forest before collecting")
 
     collect_parser = subparsers.choices["collect"]
     collect_parser.add_argument("--interval", type=float, default=15.0)

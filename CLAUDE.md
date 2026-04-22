@@ -76,6 +76,25 @@ Valid `--scenario` values: `baseline`, `cpu-spike`, `cpu-drop`, `memory-spike`, 
   --zscore-threshold 2.0  # samples beyond this many std-devs are rejected
 ```
 
+**Isolation Forest overrides** (optional):
+```bash
+  --if-contamination 0.1              # expected anomaly fraction (IF hyperparameter)
+  --if-warmup        20               # online warm-up samples before model is fitted
+  --train-data results/baseline.csv   # fit IF on pre-collected clean data (skips warm-up)
+```
+
+**Recommended two-step workflow for IF comparison:**
+```bash
+# Step 1 — collect a clean baseline to train the IF model
+python fault-injection/metric_fault_injector.py collect \
+  --scenario baseline --duration 300 --output results/baseline.csv
+
+# Step 2 — run fault scenario with IF pre-trained on clean data
+python fault-injection/metric_fault_injector.py collect \
+  --scenario cpu-spike --train-data results/baseline.csv \
+  --duration 600 --output results/cpu-spike.csv
+```
+
 **Flask serve mode** (exposes `/metric` on port 5001 for external polling):
 ```bash
 python fault-injection/metric_fault_injector.py serve
@@ -161,10 +180,11 @@ PARALLEL — Python collector (fault-injection/metric_fault_injector.py):
     ├── reads real metrics via `kubectl top pods`
     ├── applies fault multipliers to produce faulty metrics
     ├── runs MetricFilter: z-score outlier rejection → windowed median → effective metrics
-    ├── simulates HPA desired-replica count (clean / faulty / mitigated)
-    ├── simulates VPA resource recommendation (clean / faulty / mitigated)
+    ├── runs IsolationForestFilter: joint (cpu, memory) anomaly detection → windowed median
+    ├── simulates HPA desired-replica count (clean / faulty / mitigated / IF-mitigated)
+    ├── simulates VPA resource recommendation (clean / faulty / mitigated / IF-mitigated)
     ├── classifies VPA risk: under_provisioned / over_provisioned / accurate
-    └── writes 31-column CSV to results/
+    └── writes 40-column CSV to results/
 ```
 
 ### Fault Models
@@ -198,7 +218,7 @@ Risk classification written to `vpa_cpu_risk` / `vpa_memory_risk`:
 - `over_provisioned` — faulty rec > real usage × 1.5 → node capacity wasted, scheduling may fail
 - `accurate` — within normal headroom
 
-### CSV Output Schema (31 columns)
+### CSV Output Schema (40 columns)
 
 ```
 timestamp, scenario, deployment, label_selector, fault_type,
@@ -213,15 +233,22 @@ cpu_outlier_rejected, memory_outlier_rejected,
 effective_cpu_m, effective_memory_mi,
 desired_replicas_cpu_mitigated, desired_replicas_memory_mitigated,
 vpa_cpu_rec_mitigated_m, vpa_memory_rec_mitigated_mi,
-vpa_cpu_risk_mitigated, vpa_memory_risk_mitigated
+vpa_cpu_risk_mitigated, vpa_memory_risk_mitigated,
+if_sample_rejected,
+effective_cpu_m_if, effective_memory_mi_if,
+desired_replicas_cpu_if, desired_replicas_memory_if,
+vpa_cpu_rec_if_m, vpa_memory_rec_if_mi,
+vpa_cpu_risk_if, vpa_memory_risk_if
 ```
 
 Key comparisons:
 - `desired_replicas_*_clean` vs `desired_replicas_*_faulty` — HPA divergence under bad metrics
-- `desired_replicas_*_faulty` vs `desired_replicas_*_mitigated` — how much mitigation recovers toward clean
-- `vpa_*_rec_clean_*` vs `vpa_*_rec_faulty_*` — VPA resource inflation/deflation under bad metrics
-- `vpa_*_risk` vs `vpa_*_risk_mitigated` — whether mitigation resolves the reliability/availability risk
-- `cpu_outlier_rejected` / `memory_outlier_rejected` — which samples were caught by z-score filter
+- `desired_replicas_*_faulty` vs `desired_replicas_*_mitigated` — z-score recovery toward clean
+- `desired_replicas_*_faulty` vs `desired_replicas_*_if` — Isolation Forest recovery toward clean
+- `desired_replicas_*_mitigated` vs `desired_replicas_*_if` — which detector performs better
+- `vpa_*_risk` vs `vpa_*_risk_mitigated` vs `vpa_*_risk_if` — whether each method resolves reliability/availability risk
+- `cpu_outlier_rejected` / `memory_outlier_rejected` — per-metric z-score rejections
+- `if_sample_rejected` — joint (cpu+memory) rejections by Isolation Forest
 
 ## Key Files
 
